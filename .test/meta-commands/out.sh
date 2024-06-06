@@ -137,6 +137,29 @@ jq -s '
 	)
 ' temp/index.json > temp/index.json.new
 mv temp/index.json.new temp/index.json
+SOURCE_DATE_EPOCH=1709081058 \
+	docker buildx build --progress=plain \
+	--provenance=false \
+	--build-context "base:latest=oci-layout://$PWD/temp/@$(jq -r '.manifests[0].digest' index.json)" \
+	--sbom=generator="$BASHBREW_BUILDKIT_SBOM_GENERATOR" \
+	--output 'type=oci,tar=false,dest=temp_sbom/' \
+	- <<<'FROM base'
+newIndexDigest="$(jq -r '.manifests[0].digest | sub("sha256:";"")' temp_sbom/index.json)"
+sbomManifestDigest="$(jq -r '.manifests[] | select(.platform.os == "unknown").digest | sub("sha256:";"")' temp_sbom/blobs/sha256/$newIndexDigest)"
+sbomManifest="$(jq -r --arg digest "sha256:$sbomManifestDigest" '.manifests[] | select(.digest == $digest)' temp_sbom/blobs/sha256/$newIndexDigest)"
+sbomDigest="$(jq -r '.layers[0].digest | sub("sha256:";"")' temp_sbom/blobs/sha256/$sbomManifestDigest)"
+cp temp_sbom/blobs/sha256/$sbomDigest temp/blobs/sha256
+cp temp_sbom/blobs/sha256/$sbomManifestDigest temp/blobs/sha256
+cat <<< $( \
+	jq -r \
+	--argjson manifest "$sbomManifest" \
+	'
+		.manifests[0].digest as $digest |
+		.manifests[.manifests | length] |= . + $manifest |
+		.manifests[1].annotations["vnd.docker.reference.digest"] = $digest
+		' \
+	temp/index.json \
+) > temp/index.json
 # </build>
 # <push>
 crane push --index temp 'oisupport/staging-amd64:191402ad0feacf03daf9d52a492207e73ef08b0bd17265043aea13aa27e2bb3f'
