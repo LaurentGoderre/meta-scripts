@@ -26,9 +26,6 @@ def normalize_ref_to_docker:
 	ltrimstr("docker.io/")
 	| ltrimstr("library/")
 ;
-def digest_to_blob:
-	@sh "sub(\"sha256:\";\"\")"
-;
 # input: "build" object (with "buildId" top level key)
 # output: string "pull command" ("docker pull ..."), may be multiple lines, expects to run in Bash with "set -Eeuo pipefail", might be empty
 def pull_command:
@@ -322,51 +319,62 @@ def build_command:
 
 			# TODO consider / check what "crane validate" does and if it would be appropriate here
 
-			(
-				[
-					# Generate SBOM
-					@sh "SOURCE_DATE_EPOCH=\(.source.entry.SOURCE_DATE_EPOCH)",
-					"docker buildx build --progress=plain",
-					"--provenance=false",
-					"--build-context \"base:latest=oci-layout://$PWD/temp/@$(jq -r '.manifests[0].digest' index.json)\"",
-					"--sbom=generator=\"$BASHBREW_BUILDKIT_SBOM_GENERATOR\"",
-					"--output 'type=oci,tar=false,dest=temp_sbom/'",
-					"- <<<'FROM base'",
-					empty
-				] | join(" \\\n\t")
-			),
-			@sh "newIndexDigest=\"$(jq -r '.manifests[0].digest | " + digest_to_blob + "' temp_sbom/index.json)\"",
-			@sh "sbomManifestDigest=\"$(jq -r '.manifests[] | select(.platform.os == \"unknown\").digest | " + digest_to_blob + "' temp_sbom/blobs/sha256/$newIndexDigest)\"",
-			@sh "sbomManifest=\"$(jq -r --arg digest \"sha256:$sbomManifestDigest\" '.manifests[] | select(.digest == $digest)' temp_sbom/blobs/sha256/$newIndexDigest)\"",
-			@sh "sbomDigest=\"$(jq -r '.layers[0].digest | " + digest_to_blob + "' temp_sbom/blobs/sha256/$sbomManifestDigest)\"",
-			"cp temp_sbom/blobs/sha256/$sbomDigest temp/blobs/sha256",
-			"cp temp_sbom/blobs/sha256/$sbomManifestDigest temp/blobs/sha256",
-			(
-				[
-					"cat <<< $(",
-					(
-						[
-							"\tjq -r",
-							@sh "--argjson manifest \"$sbomManifest\"",
-							(
-								[
-									"'",
-									".manifests[0].digest as $digest |",
-									".manifests[.manifests | length] |= . + $manifest |",
-									".manifests[1].annotations[\"vnd.docker.reference.digest\"] = $digest",
-									"'",
-									empty
-								] | join("\n\t\t")
-							),
-							"temp/index.json",
-							empty
-						] | join(" \\\n\t")
-					),
-					") > temp/index.json",
-					empty
-				] | join(" \\\n")
-			),
-			empty
+			if build_should_sbom then
+				# we'll trick BuildKit into generating an SBOM for us, then inject it into our OCI layout
+				"# SBOM",
+				"originalImageManifest=\"$(jq -r '.manifests[0].digest' index.json)\"",
+				(
+					[
+						@sh "SOURCE_DATE_EPOCH=\(.source.entry.SOURCE_DATE_EPOCH)",
+						"docker buildx build --progress=plain",
+						"--load=false",
+						"--provenance=false",
+						"--build-context \"fake:latest=oci-layout://$PWD/temp@$originalImageManifest\"",
+						"--build-arg BUILDKIT_DOCKERFILE_CHECK=skip=all",
+						"--sbom=generator=\"$BASHBREW_BUILDKIT_SBOM_GENERATOR\"",
+						"--output 'type=oci,tar=false,dest=sbom/'",
+						"- <<<'FROM fake'",
+						empty
+					] | join(" \\\n\t")
+				),
+				"sbomIndex=\"$(jq -r '.manifests[0].digest' sbom/index.json)\"",
+				"shell=\"$(jq -r --arg originalImageManifest \"$originalImageManifest\" '",
+				(
+					[
+						"\tfirst(",
+							"\t.manifests[]",
+							"\t| select(.annotations[\"vnd.docker.reference.type\"] == \"attestation-manifest\")",
+						") as $attDesc",
+						"| @sh \"sbomManifest=\\($attDesc.digest)\",",
+							"\t@sh \"sbomManifestDesc=\\(",
+								"\t\t$attDesc",
+								"\t\t| .annotations[\"vnd.docker.reference.digest\"] = $originalImageManifest",
+								"\t\t| tojson",
+							"\t)\"",
+						empty
+					] | join("\n\t")
+				),
+				"' \"sbom/blobs/${sbomIndex/://}\")\"",
+				"eval \"$shell\"",
+				"shell=\"$(jq -r '",
+				(
+					[
+						"\t\"copyBlobs=( \\([ .config.digest, .layers[].digest | @sh ] | join(\" \")) )\"",
+						empty
+					] | join("\n\t")
+				),
+				"' \"sbom/blobs/${sbomManifest/://}\")\"",
+				"eval \"$shell\"",
+				"copyBlobs+=( \"$sbomManifest\" )",
+				"for blob in ${copyBlobs[@]}; do",
+				"\tcp sbom/blobs/${blob/://} temp/blobs/${blob/://}",
+				"done",
+				"jq -r --argjson process \"$process\" '",
+				"\t.manifests[.manifests | length] |= . + $process.descriptor",
+				"' temp/index.json > temp/index.json.new",
+				"mv temp/index.json.new temp/index.json",
+				empty
+			else empty end
 		] | join("\n")
 	else
 		error("unknown/unimplemented Builder: \($builder)")
