@@ -138,15 +138,16 @@ jq -s '
 ' temp/index.json > temp/index.json.new
 mv temp/index.json.new temp/index.json
 # SBOM
-originalImageManifest="$(jq -r '.manifests[0].digest' index.json)"
+originalImageManifest="$(jq -r '.manifests[0].digest' temp/index.json)"
 SOURCE_DATE_EPOCH=1709081058 \
 	docker buildx build --progress=plain \
 	--load=false \
 	--provenance=false \
-	--build-context "fake:latest=oci-layout://$PWD/temp@$originalImageManifest" \
 	--build-arg BUILDKIT_DOCKERFILE_CHECK=skip=all \
 	--sbom=generator="$BASHBREW_BUILDKIT_SBOM_GENERATOR" \
-	--output 'type=oci,tar=false,dest=sbom/' \
+	--output 'type=oci,tar=false,dest=sbom' \
+	--platform 'linux/amd64' \
+	--build-context "fake=oci-layout://$PWD/temp@$originalImageManifest" \
 	- <<<'FROM fake'
 sbomIndex="$(jq -r '.manifests[0].digest' sbom/index.json)"
 shell="$(jq -r --arg originalImageManifest "$originalImageManifest" '
@@ -167,12 +168,10 @@ shell="$(jq -r '
 ' "sbom/blobs/${sbomManifest/://}")"
 eval "$shell"
 copyBlobs+=( "$sbomManifest" )
-for blob in ${copyBlobs[@]}; do
-	cp sbom/blobs/${blob/://} temp/blobs/${blob/://}
+for blob in "${copyBlobs[@]}"; do
+	cp "sbom/blobs/${blob/://}" "temp/blobs/${blob/://}"
 done
-jq -r --argjson process "$process" '
-	.manifests[.manifests | length] |= . + $process.descriptor
-' temp/index.json > temp/index.json.new
+jq -r --argjson sbomManifestDesc "$sbomManifestDesc" '.manifests += [ $sbomManifestDesc ]' temp/index.json > temp/index.json.new
 mv temp/index.json.new temp/index.json
 # </build>
 # <push>

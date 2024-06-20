@@ -322,56 +322,46 @@ def build_command:
 			if build_should_sbom then
 				# we'll trick BuildKit into generating an SBOM for us, then inject it into our OCI layout
 				"# SBOM",
-				"originalImageManifest=\"$(jq -r '.manifests[0].digest' index.json)\"",
+				"originalImageManifest=\"$(jq -r '.manifests[0].digest' temp/index.json)\"",
 				(
 					[
 						@sh "SOURCE_DATE_EPOCH=\(.source.entry.SOURCE_DATE_EPOCH)",
 						"docker buildx build --progress=plain",
-						"--load=false",
-						"--provenance=false",
-						"--build-context \"fake:latest=oci-layout://$PWD/temp@$originalImageManifest\"",
-						"--build-arg BUILDKIT_DOCKERFILE_CHECK=skip=all",
+						"--load=false", "--provenance=false", # explicitly disable a few features we want to avoid
+						"--build-arg BUILDKIT_DOCKERFILE_CHECK=skip=all", # disable linting (https://github.com/moby/buildkit/pull/4962)
 						"--sbom=generator=\"$BASHBREW_BUILDKIT_SBOM_GENERATOR\"",
-						"--output 'type=oci,tar=false,dest=sbom/'",
-						"- <<<'FROM fake'",
+						"--output 'type=oci,tar=false,dest=sbom'",
+						# TODO also add appropriate "--tag" lines (which would give us a mostly correct "subject" block in the generated SBOM, but we'd then need to replace instances of ${sbomImageManifest#*:} with ${originalImageManifest#*:} for their values to be correct)
+						@sh "--platform \(.source.arches[.build.arch].platformString)",
+						"--build-context \"fake=oci-layout://$PWD/temp@$originalImageManifest\"",
+						"- <<<'FROM fake'", # note: "<<<" is a bashism (so this output must be invoked via bash)
 						empty
 					] | join(" \\\n\t")
 				),
 				"sbomIndex=\"$(jq -r '.manifests[0].digest' sbom/index.json)\"",
-				"shell=\"$(jq -r --arg originalImageManifest \"$originalImageManifest\" '",
-				(
-					[
-						"\tfirst(",
-							"\t.manifests[]",
-							"\t| select(.annotations[\"vnd.docker.reference.type\"] == \"attestation-manifest\")",
-						") as $attDesc",
-						"| @sh \"sbomManifest=\\($attDesc.digest)\",",
-							"\t@sh \"sbomManifestDesc=\\(",
-								"\t\t$attDesc",
-								"\t\t| .annotations[\"vnd.docker.reference.digest\"] = $originalImageManifest",
-								"\t\t| tojson",
-							"\t)\"",
-						empty
-					] | join("\n\t")
-				),
-				"' \"sbom/blobs/${sbomIndex/://}\")\"",
+				@sh "shell=\"$(jq -r --arg originalImageManifest \"$originalImageManifest\" \("
+					# https://docs.docker.com/build/attestations/attestation-storage/
+					first(
+						.manifests[]
+						| select(.annotations[\"vnd.docker.reference.type\"] == \"attestation-manifest\")
+					) as $attDesc
+					| @sh \"sbomManifest=\\($attDesc.digest)\",
+						@sh \"sbomManifestDesc=\\(
+							$attDesc
+							| .annotations[\"vnd.docker.reference.digest\"] = $originalImageManifest
+							| tojson
+						)\"
+				" | unindent_and_decomment_jq(4)) \"sbom/blobs/${sbomIndex/://}\")\"",
 				"eval \"$shell\"",
-				"shell=\"$(jq -r '",
-				(
-					[
-						"\t\"copyBlobs=( \\([ .config.digest, .layers[].digest | @sh ] | join(\" \")) )\"",
-						empty
-					] | join("\n\t")
-				),
-				"' \"sbom/blobs/${sbomManifest/://}\")\"",
+				@sh "shell=\"$(jq -r \("
+					\"copyBlobs=( \\([ .config.digest, .layers[].digest | @sh ] | join(\" \")) )\"
+				" | unindent_and_decomment_jq(4)) \"sbom/blobs/${sbomManifest/://}\")\"",
 				"eval \"$shell\"",
 				"copyBlobs+=( \"$sbomManifest\" )",
-				"for blob in ${copyBlobs[@]}; do",
-				"\tcp sbom/blobs/${blob/://} temp/blobs/${blob/://}",
+				"for blob in \"${copyBlobs[@]}\"; do",
+				"\tcp \"sbom/blobs/${blob/://}\" \"temp/blobs/${blob/://}\"",
 				"done",
-				"jq -r --argjson process \"$process\" '",
-				"\t.manifests[.manifests | length] |= . + $process.descriptor",
-				"' temp/index.json > temp/index.json.new",
+				"jq -r --argjson sbomManifestDesc \"$sbomManifestDesc\" '.manifests += [ $sbomManifestDesc ]' temp/index.json > temp/index.json.new",
 				"mv temp/index.json.new temp/index.json",
 				empty
 			else empty end
